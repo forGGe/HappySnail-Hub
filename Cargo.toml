@@ -5,3 +5,7 @@ authors = ["Max Payne <forgge@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+paho-mqtt = "0.6.0"
+clap = "2.33.0"
+nom = "5"
+
