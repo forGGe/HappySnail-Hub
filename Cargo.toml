@@ -8,4 +8,5 @@ edition = "2018"
 paho-mqtt = "0.6.0"
 clap = "2.33.0"
 nom = "5"
-
+typenum = "1.11.2"
+num = "0.2.0"
