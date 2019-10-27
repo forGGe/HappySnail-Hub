@@ -1,11 +1,14 @@
 extern crate typenum;
 extern crate num;
+extern crate text_io;
 
 use typenum::*;
 use std::ops::Shr;
 use num::cast::AsPrimitive;
 use std::vec::Vec;
-use std::io;
+use std::io::{Error, ErrorKind};
+use text_io::{scan, try_scan};
+use std::str;
 
 // Trait for serialize Modbus PDUs
 pub trait RequestPDU {
@@ -16,7 +19,7 @@ pub trait RequestPDU {
 
 pub trait ResponsePDU: Sized {
     type Req;
-    fn from_ascii(req: &Self::Req) -> Result<Self, io::Error>;
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error>;
 }
 
 // Calculates LRC from given byte array
@@ -60,7 +63,7 @@ impl RequestPair {
 /*------------------------------------------------------------------------------------------------*/
 
 // Abstract Modbus function represented by address and count pair.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ReadAddrCountGeneric<FnID: Unsigned> {
     addr: u16,
     cnt:  u16,
@@ -92,8 +95,14 @@ impl<FnID: Unsigned> ReadAddrCountGeneric<FnID> {
 /*------------------------------------------------------------------------------------------------*/
 
 // Modbus function #1: Read Coils.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ReadCoils(ReadAddrCountGeneric<U1>);
+
+impl ReadCoils {
+    pub fn new(addr: u16, cnt: u16) -> Self {
+        Self(ReadAddrCountGeneric::<U1>::new(addr, cnt))
+    }
+}
 
 impl RequestPDU for ReadCoils {
     type Resp = ReadCoilsResp;
@@ -103,6 +112,7 @@ impl RequestPDU for ReadCoils {
 }
 
 // Modbus function #1 response.
+#[derive(Debug)]
 pub struct ReadCoilsResp {
     cnt: u16,
     val: Vec<u8>,
@@ -112,8 +122,93 @@ pub struct ReadCoilsResp {
 impl ResponsePDU for ReadCoilsResp {
     type Req = ReadCoils;
 
-    fn from_ascii(req: &Self::Req) -> Result<Self, io::Error> {
-        Ok(Self { cnt: 0, val: Vec::new(), req: *req })
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
+        // Bytes that should be received, according to the request
+        let req_count = (req.0.cnt / 8) as u8 + 1;
+        // Actual bytes received
+        let byte_cnt: u8;
+
+        match u8::from_str_radix(&packet[0..2], 16) {
+            Ok(c) => {
+                byte_cnt = c;
+            },
+            Err(e) => {
+                println!("failed to extract count from: {} with err {}", packet, e);
+                return Err(Error::new(ErrorKind::InvalidData, "failed to extract objects count"));
+            },
+        }
+
+        if byte_cnt != req_count {
+            println!("byte_cnt: {}, req_count: {}", byte_cnt, req_count);
+            return Err(Error::new(ErrorKind::InvalidData, "length mismatch between request and response"))
+        }
+
+        let val: Vec<u8> = packet[2..].as_bytes().chunks(2).map(|chunk| {
+            let str_chunk = str::from_utf8(chunk).unwrap();
+            u8::from_str_radix(str_chunk, 16).unwrap_or_else(|e| {
+                    println!("failed to extract coils value from: {}, err: {}", str_chunk, e);
+                    0
+                }
+            )
+        }).collect();
+
+        if val.len() != byte_cnt as usize {
+            return Err(Error::new(ErrorKind::InvalidData, "length mismatch between array and header"))
+        }
+
+        Ok(Self { cnt: req.0.cnt, val, req: *req })
+    }
+}
+
+impl ReadCoilsResp {
+    fn coil(&self, mut idx: u16) -> Result<bool, Error> {
+        if idx >= (self.cnt + self.req.0.addr) || idx < self.req.0.addr {
+            return Err(Error::new(ErrorKind::NotFound, "no such idx"));
+        }
+
+        idx -= self.req.0.addr;
+
+        let byte = self.val[(idx / 8) as usize];
+        Ok((byte & (1 << (idx % 8))) != 0)
+    }
+}
+
+#[cfg(test)]
+mod modbus_tests {
+    #[test]
+    fn test_read_coil() {
+        use crate::modbus::ResponsePDU;
+        use crate::modbus::ReadCoils;
+        use crate::modbus::ReadCoilsResp;
+
+        // 11 coils, starting from 42:
+        // on, off, on, off, off, on, on, on, off, on, on
+        // in hex: (E5, 06)
+
+        let req = ReadCoils::new(42, 11);
+        let resp = ReadCoilsResp::from_ascii(&req, &"02E506".to_string()).unwrap();
+        println!("{:?}", resp);
+
+        assert_eq!(resp.cnt,    11);
+        assert_eq!(resp.val[0], 0xe5);
+        assert_eq!(resp.val[1], 0x06);
+
+        assert_eq!(resp.coil(42).unwrap(), true);
+        assert_eq!(resp.coil(43).unwrap(), false);
+        assert_eq!(resp.coil(44).unwrap(), true);
+        assert_eq!(resp.coil(45).unwrap(), false);
+        assert_eq!(resp.coil(46).unwrap(), false);
+        assert_eq!(resp.coil(47).unwrap(), true);
+        assert_eq!(resp.coil(48).unwrap(), true);
+        assert_eq!(resp.coil(49).unwrap(), true);
+        assert_eq!(resp.coil(50).unwrap(), false);
+        assert_eq!(resp.coil(51).unwrap(), true);
+        assert_eq!(resp.coil(52).unwrap(), true);
+
+        assert_eq!(resp.coil(53).is_err(), true);
+        assert_eq!(resp.coil(41).is_err(), true);
+        assert_eq!(resp.coil(0).is_err(),  true);
+
     }
 }
 
@@ -140,7 +235,7 @@ pub struct ReadDiscreteInputsResp {
 impl ResponsePDU for ReadDiscreteInputsResp {
     type Req = ReadDiscreteInputs;
 
-    fn from_ascii(req: &Self::Req) -> Result<Self, io::Error> {
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
         Ok(Self { cnt: 0, val: Vec::new(), req: *req })
     }
 }
@@ -174,7 +269,7 @@ pub struct ReadHoldingRegistersResp {
 impl ResponsePDU for ReadHoldingRegistersResp {
     type Req = ReadHoldingRegisters;
 
-    fn from_ascii(req: &Self::Req) -> Result<Self, io::Error> {
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
         Ok(Self { cnt: 0, val: Vec::new(), req: *req })
     }
 }
@@ -202,7 +297,7 @@ pub struct ReadInputRegistersResp {
 impl ResponsePDU for ReadInputRegistersResp {
     type Req = ReadInputRegisters;
 
-    fn from_ascii(req: &Self::Req) -> Result<Self, io::Error> {
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
         Ok(Self { cnt: 0, val: Vec::new(), req: *req })
     }
 }
@@ -242,7 +337,7 @@ pub struct WriteSingleCoilResp {
 impl ResponsePDU for WriteSingleCoilResp {
     type Req = WriteSingleCoil;
 
-    fn from_ascii(req: &Self::Req) -> Result<Self, io::Error> {
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
         Ok(Self { cnt: 0, val: Vec::new(), req: *req })
     }
 }
@@ -282,7 +377,7 @@ pub struct WriteSingleHoldingRegisterResp {
 impl ResponsePDU for WriteSingleHoldingRegisterResp {
     type Req = WriteSingleHoldingRegister;
 
-    fn from_ascii(req: &Self::Req) -> Result<Self, io::Error> {
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
         Ok(Self { cnt: 0, val: Vec::new(), req: *req })
     }
 }
@@ -342,7 +437,7 @@ pub struct WriteMultipleCoilsResp {
 impl ResponsePDU for WriteMultipleCoilsResp {
     type Req = WriteMultipleCoils;
 
-    fn from_ascii(req: &Self::Req) -> Result<Self, io::Error> {
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
         Ok(Self { cnt: 0, val: Vec::new(), req: *req })
     }
 }

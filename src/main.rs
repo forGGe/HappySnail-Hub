@@ -1,3 +1,5 @@
+#[macro_use]
+
 extern crate clap;
 extern crate typenum;
 extern crate paho_mqtt as mqtt;
