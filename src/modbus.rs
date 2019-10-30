@@ -1,25 +1,46 @@
 extern crate typenum;
 extern crate num;
 extern crate text_io;
+extern crate failure;
 
-use typenum::*;
 use std::ops::Shr;
-use num::cast::AsPrimitive;
 use std::vec::Vec;
-use std::io::{Error, ErrorKind};
-use text_io::{scan, try_scan};
+use std::error;
 use std::str;
+use typenum::*;
+use num::cast::AsPrimitive;
+use text_io::{scan, try_scan};
+use failure::{Error, Fail};
+
+#[derive(Debug, Fail)]
+pub enum ModbusError {
+    #[fail(display = "Invalid frame")]
+    InvalidFrame,
+    #[fail(display = "Invalid CRC")]
+    InvalidCRC,
+    #[fail(display = "Invalid Data")]
+    InvalidData,
+    #[fail(display = "Invalid function ID")]
+    InvalidFnId,
+    #[fail(display = "Invalid slave address")]
+    InvalidAddr,
+    #[fail(display = "Mismatch between response and request")]
+    ReqRespMismatch,
+    #[fail(display = "No such index")]
+    NoSuchIdx,
+}
 
 // Trait for serialize Modbus PDUs
 pub trait RequestPDU {
-    type Resp;
+    type Resp: ResponsePDU;
     fn as_ascii(&self) -> String;
     fn lrc(&self, slave: u8) -> u8;
+    fn fn_id() -> u8;
 }
 
 pub trait ResponsePDU: Sized {
     type Req;
-    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error>;
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError>;
 }
 
 // Calculates LRC from given byte array
@@ -58,7 +79,6 @@ impl RequestPair {
         format!("{:02X}{:04X}{:04X}", fn_id, self.0, self.1)
     }
 }
-
 
 /*------------------------------------------------------------------------------------------------*/
 
@@ -107,6 +127,7 @@ impl ReadCoils {
 impl RequestPDU for ReadCoils {
     type Resp = ReadCoilsResp;
 
+    fn fn_id()                  -> u8       { ReadAddrCountGeneric::<U1>::fn_id() }
     fn as_ascii(&self)          -> String   { self.0.as_ascii() }
     fn lrc(&self, slave: u8)    -> u8       { self.0.lrc(slave) }
 }
@@ -122,7 +143,7 @@ pub struct ReadCoilsResp {
 impl ResponsePDU for ReadCoilsResp {
     type Req = ReadCoils;
 
-    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
         // Bytes that should be received, according to the request
         let req_count = (req.0.cnt / 8) as u8 + 1;
         // Actual bytes received
@@ -134,13 +155,13 @@ impl ResponsePDU for ReadCoilsResp {
             },
             Err(e) => {
                 println!("failed to extract count from: {} with err {}", packet, e);
-                return Err(Error::new(ErrorKind::InvalidData, "failed to extract objects count"));
+                return Err(ModbusError::InvalidFrame);
             },
         }
 
         if byte_cnt != req_count {
             println!("byte_cnt: {}, req_count: {}", byte_cnt, req_count);
-            return Err(Error::new(ErrorKind::InvalidData, "length mismatch between request and response"))
+            return Err(ModbusError::ReqRespMismatch);
         }
 
         let val: Vec<u8> = packet[2..].as_bytes().chunks(2).map(|chunk| {
@@ -153,7 +174,7 @@ impl ResponsePDU for ReadCoilsResp {
         }).collect();
 
         if val.len() != byte_cnt as usize {
-            return Err(Error::new(ErrorKind::InvalidData, "length mismatch between array and header"))
+            return Err(ModbusError::ReqRespMismatch);
         }
 
         Ok(Self { cnt: req.0.cnt, val, req: *req })
@@ -161,9 +182,9 @@ impl ResponsePDU for ReadCoilsResp {
 }
 
 impl ReadCoilsResp {
-    fn coil(&self, mut idx: u16) -> Result<bool, Error> {
+    fn coil(&self, mut idx: u16) -> Result<bool, ModbusError> {
         if idx >= (self.cnt + self.req.0.addr) || idx < self.req.0.addr {
-            return Err(Error::new(ErrorKind::NotFound, "no such idx"));
+            return Err(ModbusError::NoSuchIdx);
         }
 
         idx -= self.req.0.addr;
@@ -174,42 +195,40 @@ impl ReadCoilsResp {
 }
 
 #[cfg(test)]
-mod modbus_tests {
-    #[test]
-    fn test_read_coil() {
-        use crate::modbus::ResponsePDU;
-        use crate::modbus::ReadCoils;
-        use crate::modbus::ReadCoilsResp;
+#[test]
+fn test_read_coil() {
+    use crate::modbus::ResponsePDU;
+    use crate::modbus::ReadCoils;
+    use crate::modbus::ReadCoilsResp;
 
-        // 11 coils, starting from 42:
-        // on, off, on, off, off, on, on, on, off, on, on
-        // in hex: (E5, 06)
+    // 11 coils, starting from 42:
+    // on, off, on, off, off, on, on, on, off, on, on
+    // in hex: (E5, 06)
 
-        let req = ReadCoils::new(42, 11);
-        let resp = ReadCoilsResp::from_ascii(&req, &"02E506".to_string()).unwrap();
-        println!("{:?}", resp);
+    let req = ReadCoils::new(42, 11);
+    let resp = ReadCoilsResp::from_ascii(&req, &"02E506".to_string()).unwrap();
+    println!("{:?}", resp);
 
-        assert_eq!(resp.cnt,    11);
-        assert_eq!(resp.val[0], 0xe5);
-        assert_eq!(resp.val[1], 0x06);
+    assert_eq!(resp.cnt,    11);
+    assert_eq!(resp.val[0], 0xe5);
+    assert_eq!(resp.val[1], 0x06);
 
-        assert_eq!(resp.coil(42).unwrap(), true);
-        assert_eq!(resp.coil(43).unwrap(), false);
-        assert_eq!(resp.coil(44).unwrap(), true);
-        assert_eq!(resp.coil(45).unwrap(), false);
-        assert_eq!(resp.coil(46).unwrap(), false);
-        assert_eq!(resp.coil(47).unwrap(), true);
-        assert_eq!(resp.coil(48).unwrap(), true);
-        assert_eq!(resp.coil(49).unwrap(), true);
-        assert_eq!(resp.coil(50).unwrap(), false);
-        assert_eq!(resp.coil(51).unwrap(), true);
-        assert_eq!(resp.coil(52).unwrap(), true);
+    assert_eq!(resp.coil(42).unwrap(), true);
+    assert_eq!(resp.coil(43).unwrap(), false);
+    assert_eq!(resp.coil(44).unwrap(), true);
+    assert_eq!(resp.coil(45).unwrap(), false);
+    assert_eq!(resp.coil(46).unwrap(), false);
+    assert_eq!(resp.coil(47).unwrap(), true);
+    assert_eq!(resp.coil(48).unwrap(), true);
+    assert_eq!(resp.coil(49).unwrap(), true);
+    assert_eq!(resp.coil(50).unwrap(), false);
+    assert_eq!(resp.coil(51).unwrap(), true);
+    assert_eq!(resp.coil(52).unwrap(), true);
 
-        assert_eq!(resp.coil(53).is_err(), true);
-        assert_eq!(resp.coil(41).is_err(), true);
-        assert_eq!(resp.coil(0).is_err(),  true);
+    assert_eq!(resp.coil(53).is_err(), true);
+    assert_eq!(resp.coil(41).is_err(), true);
+    assert_eq!(resp.coil(0).is_err(),  true);
 
-    }
 }
 
 /*------------------------------------------------------------------------------------------------*/
@@ -221,6 +240,7 @@ pub struct ReadDiscreteInputs(ReadAddrCountGeneric<U2>);
 impl RequestPDU for ReadDiscreteInputs {
     type Resp = ReadDiscreteInputsResp;
 
+    fn fn_id()                  -> u8       { ReadAddrCountGeneric::<U2>::fn_id() }
     fn as_ascii(&self)          -> String   { self.0.as_ascii() }
     fn lrc(&self, slave: u8)    -> u8       { self.0.lrc(slave) }
 }
@@ -235,7 +255,7 @@ pub struct ReadDiscreteInputsResp {
 impl ResponsePDU for ReadDiscreteInputsResp {
     type Req = ReadDiscreteInputs;
 
-    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
         Ok(Self { cnt: 0, val: Vec::new(), req: *req })
     }
 }
@@ -255,6 +275,7 @@ impl ReadHoldingRegisters {
 impl RequestPDU for ReadHoldingRegisters {
     type Resp = ReadHoldingRegistersResp;
 
+    fn fn_id()                  -> u8       { ReadAddrCountGeneric::<U3>::fn_id() }
     fn as_ascii(&self)          -> String   { self.0.as_ascii() }
     fn lrc(&self, slave: u8)    -> u8       { self.0.lrc(slave) }
 }
@@ -269,7 +290,7 @@ pub struct ReadHoldingRegistersResp {
 impl ResponsePDU for ReadHoldingRegistersResp {
     type Req = ReadHoldingRegisters;
 
-    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
         Ok(Self { cnt: 0, val: Vec::new(), req: *req })
     }
 }
@@ -283,6 +304,7 @@ pub struct ReadInputRegisters(ReadAddrCountGeneric<U4>);
 impl RequestPDU for ReadInputRegisters {
     type Resp = ReadInputRegistersResp;
 
+    fn fn_id()                  -> u8       { ReadAddrCountGeneric::<U4>::fn_id() }
     fn as_ascii(&self)          -> String   { self.0.as_ascii() }
     fn lrc(&self, slave: u8)    -> u8       { self.0.lrc(slave) }
 }
@@ -297,7 +319,7 @@ pub struct ReadInputRegistersResp {
 impl ResponsePDU for ReadInputRegistersResp {
     type Req = ReadInputRegisters;
 
-    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
         Ok(Self { cnt: 0, val: Vec::new(), req: *req })
     }
 }
@@ -318,6 +340,8 @@ impl WriteSingleCoil {
 impl RequestPDU for WriteSingleCoil {
     type Resp = WriteSingleCoilResp;
 
+    fn fn_id() -> u8 { Self::FN_ID }
+
     fn as_ascii(&self) -> String {
         RequestPair(self.addr, if self.coil { 0xff00 } else { 0x0000 }).as_ascii(Self::FN_ID)
     }
@@ -337,7 +361,7 @@ pub struct WriteSingleCoilResp {
 impl ResponsePDU for WriteSingleCoilResp {
     type Req = WriteSingleCoil;
 
-    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
         Ok(Self { cnt: 0, val: Vec::new(), req: *req })
     }
 }
@@ -358,6 +382,8 @@ impl WriteSingleHoldingRegister {
 impl RequestPDU for WriteSingleHoldingRegister {
     type Resp = WriteSingleHoldingRegisterResp;
 
+    fn fn_id() -> u8 { Self::FN_ID }
+
     fn as_ascii(&self) -> String {
         RequestPair(self.addr, self.val).as_ascii(Self::FN_ID)
     }
@@ -377,7 +403,7 @@ pub struct WriteSingleHoldingRegisterResp {
 impl ResponsePDU for WriteSingleHoldingRegisterResp {
     type Req = WriteSingleHoldingRegister;
 
-    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
         Ok(Self { cnt: 0, val: Vec::new(), req: *req })
     }
 }
@@ -401,6 +427,8 @@ impl WriteMultipleCoils {
 
 impl RequestPDU for WriteMultipleCoils {
     type Resp = WriteMultipleCoilsResp;
+
+    fn fn_id() -> u8 { Self::FN_ID }
 
     fn as_ascii(&self) -> String {
         format!("{:02X}{:04X}{:04X}{:02X}{:16X}", Self::FN_ID, self.addr, self.cnt, self.sz, self.val)
@@ -437,7 +465,7 @@ pub struct WriteMultipleCoilsResp {
 impl ResponsePDU for WriteMultipleCoilsResp {
     type Req = WriteMultipleCoils;
 
-    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, Error> {
+    fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
         Ok(Self { cnt: 0, val: Vec::new(), req: *req })
     }
 }
@@ -449,3 +477,76 @@ pub fn make_request_frame(slave_address: u8, pdu: impl RequestPDU) -> String {
     format!(":{:02X}{}{:02X}\r\n", slave_address, pdu.as_ascii(), pdu.lrc(slave_address))
 }
 
+pub fn extract_response<T, R>(slave_address: u8, req: &T, packet: &String) -> Result<R, ModbusError>
+where
+    T: RequestPDU<Resp = R>,
+    R: ResponsePDU<Req = T>,
+{
+    if !packet.starts_with(":") || !packet.ends_with("\r\n") {
+        return Err(ModbusError::InvalidFrame);
+    }
+
+    let len = packet.len();
+
+    let addr
+        = u8::from_str_radix(packet.get(1..3).ok_or(ModbusError::InvalidAddr)?, 16)
+            .map_err(|e| ModbusError::InvalidAddr)?;
+    let fn_id
+        = u8::from_str_radix(packet.get(3..5).ok_or(ModbusError::InvalidFnId)?, 16)
+            .map_err(|e| ModbusError::InvalidFnId)?;
+    let pdu = packet.get(5..len-4).ok_or(ModbusError::InvalidData)?;
+    let crc
+        = u8::from_str_radix(packet.get(len - 4..len - 2).ok_or(ModbusError::InvalidCRC)?, 16)
+            .map_err(|e| ModbusError::InvalidCRC)?;
+
+    println!("extracted addr: {:02X} fn: {:02X} pdu: {} crc: {:02X}",
+            addr, fn_id, pdu, crc);
+
+    if fn_id != T::fn_id() {
+
+    }
+
+    R::from_ascii(req, &pdu.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn test_extract_response() {
+    use crate::modbus::ResponsePDU;
+    use crate::modbus::ReadCoils;
+    use crate::modbus::ReadCoilsResp;
+
+    // 11 coils, starting from 42:
+    // on, off, on, off, off, on, on, on, off, on, on
+    // in hex: (E5, 06)
+
+    let coil_addr = 42;
+    let coil_cnt = 11;
+    let slave_id = 8;
+
+    let req = ReadCoils::new(coil_addr, coil_cnt);
+    // TODO: fill correct values for slave ID etc.
+    let resp = extract_response(slave_id, &req, &":08FF02E506FF\r\n".to_string()).unwrap();
+    println!("{:?}", resp);
+
+    assert_eq!(resp.cnt,    11);
+    assert_eq!(resp.val[0], 0xe5);
+    assert_eq!(resp.val[1], 0x06);
+
+    assert_eq!(resp.coil(42).unwrap(), true);
+    assert_eq!(resp.coil(43).unwrap(), false);
+    assert_eq!(resp.coil(44).unwrap(), true);
+    assert_eq!(resp.coil(45).unwrap(), false);
+    assert_eq!(resp.coil(46).unwrap(), false);
+    assert_eq!(resp.coil(47).unwrap(), true);
+    assert_eq!(resp.coil(48).unwrap(), true);
+    assert_eq!(resp.coil(49).unwrap(), true);
+    assert_eq!(resp.coil(50).unwrap(), false);
+    assert_eq!(resp.coil(51).unwrap(), true);
+    assert_eq!(resp.coil(52).unwrap(), true);
+
+    assert_eq!(resp.coil(53).is_err(), true);
+    assert_eq!(resp.coil(41).is_err(), true);
+    assert_eq!(resp.coil(0).is_err(),  true);
+
+}
