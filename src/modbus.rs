@@ -483,7 +483,7 @@ where
     R: ResponsePDU<Req = T>,
 {
     if !packet.starts_with(":") || !packet.ends_with("\r\n") {
-        return Err(ModbusError::InvalidFrame);
+        Err(ModbusError::InvalidFrame)?
     }
 
     let len = packet.len();
@@ -499,11 +499,31 @@ where
         = u8::from_str_radix(packet.get(len - 4..len - 2).ok_or(ModbusError::InvalidCRC)?, 16)
             .map_err(|e| ModbusError::InvalidCRC)?;
 
+    // Data protected by CRC
+    let data_under_crc = packet
+        .get(1..len - 4)
+        .ok_or(ModbusError::InvalidData)?
+        .as_bytes()
+        .chunks(2);
+
     println!("extracted addr: {:02X} fn: {:02X} pdu: {} crc: {:02X}",
             addr, fn_id, pdu, crc);
 
-    if fn_id != T::fn_id() {
+    let mut complete_data = Vec::new();
 
+    for chunk in data_under_crc {
+        let byte = u8::from_str_radix(str::from_utf8(chunk).unwrap(), 16).map_err(|e| ModbusError::InvalidData)?;
+        complete_data.push(byte);
+    }
+
+    let calc_crc = generic_lrc(complete_data.as_slice());
+
+    if calc_crc != crc {
+        Err(ModbusError::InvalidCRC)?
+    }
+
+    if fn_id != T::fn_id() {
+        Err(ModbusError::InvalidFnId)?
     }
 
     R::from_ascii(req, &pdu.to_string())
@@ -526,27 +546,34 @@ fn test_extract_response() {
 
     let req = ReadCoils::new(coil_addr, coil_cnt);
     // TODO: fill correct values for slave ID etc.
-    let resp = extract_response(slave_id, &req, &":08FF02E506FF\r\n".to_string()).unwrap();
-    println!("{:?}", resp);
+    let rc = extract_response(slave_id, &req, &":080102E5060A\r\n".to_string());
+    if let Err(e) = rc {
+        println!("failed to extract: {}, aborting test", e);
+        assert!(false);
+    } else {
+        let resp = rc.unwrap();
 
-    assert_eq!(resp.cnt,    11);
-    assert_eq!(resp.val[0], 0xe5);
-    assert_eq!(resp.val[1], 0x06);
+        println!("{:?}", resp);
 
-    assert_eq!(resp.coil(42).unwrap(), true);
-    assert_eq!(resp.coil(43).unwrap(), false);
-    assert_eq!(resp.coil(44).unwrap(), true);
-    assert_eq!(resp.coil(45).unwrap(), false);
-    assert_eq!(resp.coil(46).unwrap(), false);
-    assert_eq!(resp.coil(47).unwrap(), true);
-    assert_eq!(resp.coil(48).unwrap(), true);
-    assert_eq!(resp.coil(49).unwrap(), true);
-    assert_eq!(resp.coil(50).unwrap(), false);
-    assert_eq!(resp.coil(51).unwrap(), true);
-    assert_eq!(resp.coil(52).unwrap(), true);
+        assert_eq!(resp.cnt,    11);
+        assert_eq!(resp.val[0], 0xe5);
+        assert_eq!(resp.val[1], 0x06);
 
-    assert_eq!(resp.coil(53).is_err(), true);
-    assert_eq!(resp.coil(41).is_err(), true);
-    assert_eq!(resp.coil(0).is_err(),  true);
+        assert_eq!(resp.coil(42).unwrap(), true);
+        assert_eq!(resp.coil(43).unwrap(), false);
+        assert_eq!(resp.coil(44).unwrap(), true);
+        assert_eq!(resp.coil(45).unwrap(), false);
+        assert_eq!(resp.coil(46).unwrap(), false);
+        assert_eq!(resp.coil(47).unwrap(), true);
+        assert_eq!(resp.coil(48).unwrap(), true);
+        assert_eq!(resp.coil(49).unwrap(), true);
+        assert_eq!(resp.coil(50).unwrap(), false);
+        assert_eq!(resp.coil(51).unwrap(), true);
+        assert_eq!(resp.coil(52).unwrap(), true);
 
+        assert_eq!(resp.coil(53).is_err(), true);
+        assert_eq!(resp.coil(41).is_err(), true);
+        assert_eq!(resp.coil(0).is_err(),  true);
+
+    }
 }
