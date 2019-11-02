@@ -5,11 +5,13 @@ extern crate failure;
 
 use std::ops::Shr;
 use std::vec::Vec;
-use std::error;
 use std::str;
+use std::fs::File;
+use std::io::{Read, Write, BufRead};
+use std::io::prelude::*;
+use std::io::BufReader;
 use typenum::*;
 use num::cast::AsPrimitive;
-use text_io::{scan, try_scan};
 use failure::{Error, Fail};
 
 #[derive(Debug, Fail)]
@@ -28,6 +30,8 @@ pub enum ModbusError {
     ReqRespMismatch,
     #[fail(display = "No such index")]
     NoSuchIdx,
+    #[fail(display = "I/O Error")]
+    IoErr,
 }
 
 // Trait for serialize Modbus PDUs
@@ -112,6 +116,108 @@ impl<FnID: Unsigned> ReadAddrCountGeneric<FnID> {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ReadAddrCountGenericResp {
+    cnt: u16,
+    data: Vec<u8>,
+}
+
+impl ReadAddrCountGenericResp {
+    fn from_ascii(packet: &String, req_cnt: u16) -> Result<Self, ModbusError> {
+        // Bytes that should be received, according to the request
+        let req_count = (req_cnt / 8) as u8 + 1;
+        // Actual bytes received
+        let byte_cnt: u8;
+
+        match u8::from_str_radix(&packet[0..2], 16) {
+            Ok(c) => {
+                byte_cnt = c;
+            },
+            Err(e) => {
+                println!("failed to extract count from: {} with err {}", packet, e);
+                return Err(ModbusError::InvalidFrame);
+            },
+        }
+
+        if byte_cnt != req_count {
+            println!("byte_cnt: {}, req_count: {}", byte_cnt, req_count);
+            return Err(ModbusError::ReqRespMismatch);
+        }
+
+        let data: Vec<u8> = packet[2..].as_bytes().chunks(2).map(|chunk| {
+            let str_chunk = str::from_utf8(chunk).unwrap();
+            u8::from_str_radix(str_chunk, 16).unwrap_or_else(|e| {
+                    println!("failed to extract object value from: {}, err: {}", str_chunk, e);
+                    0
+                }
+            )
+        }).collect();
+
+        if data.len() != byte_cnt as usize {
+            return Err(ModbusError::InvalidData);
+        }
+
+        Ok(Self { cnt: req_cnt, data })
+    }
+
+    fn object(&self, mut idx: u16, req_addr: u16) -> Result<bool, ModbusError> {
+        if idx >= (self.cnt + req_addr) || idx < req_addr {
+            return Err(ModbusError::NoSuchIdx);
+        }
+
+        idx -= req_addr;
+
+        let byte = self.data[(idx / 8) as usize];
+        Ok((byte & (1 << (idx % 8))) != 0)
+    }
+}
+
+pub struct ReadAddrCountGeneric16BitResp {
+    cnt: u8,
+    data: Vec<u16>,
+}
+
+impl ReadAddrCountGeneric16BitResp {
+    fn from_ascii(req_cnt: u16, packet: &String) -> Result<Self, ModbusError> {
+        // Actual bytes received
+        let byte_cnt: u8;
+
+        match u8::from_str_radix(&packet[0..2], 16) {
+            Ok(c) => {
+                byte_cnt = c;
+            },
+            Err(e) => {
+                println!("failed to extract count from: {} with err {}", packet, e);
+                return Err(ModbusError::InvalidFrame);
+            },
+        }
+
+        if (byte_cnt / 2) as u16 != req_cnt {
+            println!("byte_cnt: {}, req_cnt: {}", byte_cnt, req_cnt);
+            return Err(ModbusError::ReqRespMismatch);
+        }
+
+        let data: Vec<u16> = packet[2..].as_bytes().chunks(4).map(|chunk| {
+            let str_chunk = str::from_utf8(chunk).unwrap();
+            u16::from_str_radix(str_chunk, 16).unwrap_or_else(|e| {
+                    println!("failed to extract object value from: {}, err: {}", str_chunk, e);
+                    0
+                }
+            )
+        }).collect();
+
+        if data.len() * 2 != byte_cnt as usize {
+            return Err(ModbusError::InvalidData);
+        }
+
+        Ok(Self { cnt: byte_cnt, data })
+    }
+
+    fn object(&self, idx: u8) -> Result<u16, ModbusError> {
+        self.data.get(idx as usize).ok_or(ModbusError::NoSuchIdx).map(|v| *v)
+    }
+}
+
 /*------------------------------------------------------------------------------------------------*/
 
 // Modbus function #1: Read Coils.
@@ -135,8 +241,7 @@ impl RequestPDU for ReadCoils {
 // Modbus function #1 response.
 #[derive(Debug)]
 pub struct ReadCoilsResp {
-    cnt: u16,
-    val: Vec<u8>,
+    resp: ReadAddrCountGenericResp,
     req: ReadCoils,
 }
 
@@ -144,53 +249,13 @@ impl ResponsePDU for ReadCoilsResp {
     type Req = ReadCoils;
 
     fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
-        // Bytes that should be received, according to the request
-        let req_count = (req.0.cnt / 8) as u8 + 1;
-        // Actual bytes received
-        let byte_cnt: u8;
-
-        match u8::from_str_radix(&packet[0..2], 16) {
-            Ok(c) => {
-                byte_cnt = c;
-            },
-            Err(e) => {
-                println!("failed to extract count from: {} with err {}", packet, e);
-                return Err(ModbusError::InvalidFrame);
-            },
-        }
-
-        if byte_cnt != req_count {
-            println!("byte_cnt: {}, req_count: {}", byte_cnt, req_count);
-            return Err(ModbusError::ReqRespMismatch);
-        }
-
-        let val: Vec<u8> = packet[2..].as_bytes().chunks(2).map(|chunk| {
-            let str_chunk = str::from_utf8(chunk).unwrap();
-            u8::from_str_radix(str_chunk, 16).unwrap_or_else(|e| {
-                    println!("failed to extract coils value from: {}, err: {}", str_chunk, e);
-                    0
-                }
-            )
-        }).collect();
-
-        if val.len() != byte_cnt as usize {
-            return Err(ModbusError::ReqRespMismatch);
-        }
-
-        Ok(Self { cnt: req.0.cnt, val, req: *req })
+        Ok(Self { req: *req, resp: ReadAddrCountGenericResp::from_ascii(packet, req.0.cnt)? })
     }
 }
 
 impl ReadCoilsResp {
     fn coil(&self, mut idx: u16) -> Result<bool, ModbusError> {
-        if idx >= (self.cnt + self.req.0.addr) || idx < self.req.0.addr {
-            return Err(ModbusError::NoSuchIdx);
-        }
-
-        idx -= self.req.0.addr;
-
-        let byte = self.val[(idx / 8) as usize];
-        Ok((byte & (1 << (idx % 8))) != 0)
+        self.resp.object(idx, self.req.0.addr)
     }
 }
 
@@ -209,9 +274,9 @@ fn test_read_coil() {
     let resp = ReadCoilsResp::from_ascii(&req, &"02E506".to_string()).unwrap();
     println!("{:?}", resp);
 
-    assert_eq!(resp.cnt,    11);
-    assert_eq!(resp.val[0], 0xe5);
-    assert_eq!(resp.val[1], 0x06);
+    assert_eq!(resp.resp.cnt,    11);
+    assert_eq!(resp.resp.data[0], 0xe5);
+    assert_eq!(resp.resp.data[1], 0x06);
 
     assert_eq!(resp.coil(42).unwrap(), true);
     assert_eq!(resp.coil(43).unwrap(), false);
@@ -247,8 +312,7 @@ impl RequestPDU for ReadDiscreteInputs {
 
 // Modbus function #2 response.
 pub struct ReadDiscreteInputsResp {
-    cnt: u16,
-    val: Vec<u8>,
+    resp: ReadAddrCountGenericResp,
     req: ReadDiscreteInputs,
 }
 
@@ -256,7 +320,13 @@ impl ResponsePDU for ReadDiscreteInputsResp {
     type Req = ReadDiscreteInputs;
 
     fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
-        Ok(Self { cnt: 0, val: Vec::new(), req: *req })
+        Ok(Self { req: *req, resp: ReadAddrCountGenericResp::from_ascii(packet, req.0.cnt)? })
+    }
+}
+
+impl ReadDiscreteInputsResp {
+    fn discrete_input(&self, mut idx: u16) -> Result<bool, ModbusError> {
+        self.resp.object(idx, self.req.0.addr)
     }
 }
 
@@ -282,8 +352,7 @@ impl RequestPDU for ReadHoldingRegisters {
 
 // Modbus function #3 response.
 pub struct ReadHoldingRegistersResp {
-    cnt: u16,
-    val: Vec<u8>,
+    resp: ReadAddrCountGeneric16BitResp,
     req: ReadHoldingRegisters,
 }
 
@@ -291,13 +360,19 @@ impl ResponsePDU for ReadHoldingRegistersResp {
     type Req = ReadHoldingRegisters;
 
     fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
-        Ok(Self { cnt: 0, val: Vec::new(), req: *req })
+        Ok(Self { resp: ReadAddrCountGeneric16BitResp::from_ascii(req.0.cnt, packet)?, req: *req })
+    }
+}
+
+impl ReadHoldingRegistersResp {
+    fn register(&self, idx: u8) -> Result<u16, ModbusError> {
+        self.resp.object(idx)
     }
 }
 
 /*------------------------------------------------------------------------------------------------*/
 
-// Modbus function #4: Read Input Registers.
+// Modbus function #4: Read Multiple Input Registers.
 #[derive(Clone, Copy)]
 pub struct ReadInputRegisters(ReadAddrCountGeneric<U4>);
 
@@ -311,8 +386,7 @@ impl RequestPDU for ReadInputRegisters {
 
 // Modbus function #4 response.
 pub struct ReadInputRegistersResp {
-    cnt: u16,
-    val: Vec<u8>,
+    resp: ReadAddrCountGeneric16BitResp,
     req: ReadInputRegisters,
 }
 
@@ -320,7 +394,13 @@ impl ResponsePDU for ReadInputRegistersResp {
     type Req = ReadInputRegisters;
 
     fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
-        Ok(Self { cnt: 0, val: Vec::new(), req: *req })
+        Ok(Self { resp: ReadAddrCountGeneric16BitResp::from_ascii(req.0.cnt, packet)?, req: *req })
+    }
+}
+
+impl ReadInputRegistersResp {
+    fn register(&self, idx: u8) -> Result<u16, ModbusError> {
+        self.resp.object(idx)
     }
 }
 
@@ -351,18 +431,21 @@ impl RequestPDU for WriteSingleCoil {
     }
 }
 
-// Modbus function #2 response.
-pub struct WriteSingleCoilResp {
-    cnt: u16,
-    val: Vec<u8>,
-    req: WriteSingleCoil,
-}
+// Modbus function #5 response.
+pub struct WriteSingleCoilResp;
 
 impl ResponsePDU for WriteSingleCoilResp {
     type Req = WriteSingleCoil;
 
     fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
-        Ok(Self { cnt: 0, val: Vec::new(), req: *req })
+        let resp_addr = u16::from_str_radix(&packet[0..4], 16).map_err(|e| ModbusError::InvalidData)?;
+        let resp_val = u16::from_str_radix(&packet[4..8], 16).map_err(|e| ModbusError::InvalidData)?;
+
+        if resp_addr != req.addr || resp_val != ( if req.coil { 0xff00 } else { 0x0000 } ) {
+            Err(ModbusError::ReqRespMismatch)?
+        }
+
+        Ok(Self{})
     }
 }
 
@@ -393,18 +476,21 @@ impl RequestPDU for WriteSingleHoldingRegister {
     }
 }
 
-// Modbus function #2 response.
-pub struct WriteSingleHoldingRegisterResp {
-    cnt: u16,
-    val: Vec<u8>,
-    req: WriteSingleHoldingRegister,
-}
+// Modbus function #6 response.
+pub struct WriteSingleHoldingRegisterResp;
 
 impl ResponsePDU for WriteSingleHoldingRegisterResp {
     type Req = WriteSingleHoldingRegister;
 
     fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
-        Ok(Self { cnt: 0, val: Vec::new(), req: *req })
+        let resp_addr = u16::from_str_radix(&packet[0..4], 16).map_err(|e| ModbusError::InvalidData)?;
+        let resp_val = u16::from_str_radix(&packet[4..8], 16).map_err(|e| ModbusError::InvalidData)?;
+
+        if resp_addr != req.addr || resp_val != req.val {
+            Err(ModbusError::ReqRespMismatch)?
+        }
+
+        Ok(Self{})
     }
 }
 
@@ -455,25 +541,28 @@ impl RequestPDU for WriteMultipleCoils {
     }
 }
 
-// Modbus function #2 response.
-pub struct WriteMultipleCoilsResp {
-    cnt: u16,
-    val: Vec<u8>,
-    req: WriteMultipleCoils,
-}
+// Modbus function #15 response.
+pub struct WriteMultipleCoilsResp;
 
 impl ResponsePDU for WriteMultipleCoilsResp {
     type Req = WriteMultipleCoils;
 
     fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
-        Ok(Self { cnt: 0, val: Vec::new(), req: *req })
+        let resp_addr = u16::from_str_radix(&packet[0..4], 16).map_err(|e| ModbusError::InvalidData)?;
+        let resp_val = u16::from_str_radix(&packet[4..8], 16).map_err(|e| ModbusError::InvalidData)?;
+
+        if resp_addr != req.addr || resp_val != req.cnt {
+            Err(ModbusError::ReqRespMismatch)?
+        }
+
+        Ok(Self{})
     }
 }
 
 /*------------------------------------------------------------------------------------------------*/
 
 // Makes the request frame from given PDU for given slave device
-pub fn make_request_frame(slave_address: u8, pdu: impl RequestPDU) -> String {
+pub fn make_request_frame(slave_address: u8, pdu: &impl RequestPDU) -> String {
     format!(":{:02X}{}{:02X}\r\n", slave_address, pdu.as_ascii(), pdu.lrc(slave_address))
 }
 
@@ -555,9 +644,9 @@ fn test_extract_response() {
 
         println!("{:?}", resp);
 
-        assert_eq!(resp.cnt,    11);
-        assert_eq!(resp.val[0], 0xe5);
-        assert_eq!(resp.val[1], 0x06);
+        assert_eq!(resp.resp.cnt,    11);
+        assert_eq!(resp.resp.data[0], 0xe5);
+        assert_eq!(resp.resp.data[1], 0x06);
 
         assert_eq!(resp.coil(42).unwrap(), true);
         assert_eq!(resp.coil(43).unwrap(), false);
@@ -576,4 +665,16 @@ fn test_extract_response() {
         assert_eq!(resp.coil(0).is_err(),  true);
 
     }
+}
+
+fn do_master_request<T, R>(addr: u8, req: &T, mut fl: &File, timeout: u32) -> Result<R, ModbusError>
+    where
+        T: RequestPDU<Resp = R>,
+        R: ResponsePDU<Req = T>,
+{
+    let mut data = Vec::new();
+    fl.write_all(make_request_frame(addr, req).as_bytes()).map_err(|e| ModbusError::IoErr)?;
+    let mut reader = BufReader::new(fl);
+    reader.read_until(b'\n', &mut data).map_err(|e| ModbusError::IoErr)?;
+    extract_response(addr, req, &String::from_utf8(data).map_err(|e| ModbusError::IoErr)?)
 }

@@ -15,7 +15,7 @@ use std::process;
 fn main() {
     println!("Hello, world!");
 
-    println!("{}", modbus::make_request_frame(247, modbus::ReadHoldingRegisters::new(5001, 10)));
+    println!("{}", modbus::make_request_frame(247, &modbus::ReadHoldingRegisters::new(5001, 10)));
 
     let matches = App::new("HappySnail Hub")
         .version("0.1.0")
