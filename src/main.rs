@@ -11,6 +11,8 @@ use std::time::Duration;
 use std::process;
 use std::{thread, time};
 
+use serde_json::json;
+
 //-----
 
 fn main() {
@@ -102,7 +104,13 @@ fn main() {
             println!("temperature: {}, MCU temperature: {}, humidity: {}", temp, mcu_temp, humid);
 
             // Create a message and publish it
-            let msg = mqtt::Message::new("test", "Hello world!", 0);
+            let msg_json = json!({
+                "temp": temp,
+                "mcu_temp": mcu_temp,
+                "rh": humid,
+            });
+
+            let msg = mqtt::Message::new("v1/devices/me/telemetry", msg_json.to_string(), 0);
             if let Err(e) =  cli.publish(msg) {
                 println!("Unable to publish:\n\t{:?}", e);
                 break;
