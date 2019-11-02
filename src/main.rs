@@ -9,14 +9,11 @@ mod modbus;
 use clap::{Arg, App};
 use std::time::Duration;
 use std::process;
+use std::{thread, time};
 
 //-----
 
 fn main() {
-    println!("Hello, world!");
-
-    println!("{}", modbus::make_request_frame(247, &modbus::ReadHoldingRegisters::new(5001, 10)));
-
     let matches = App::new("HappySnail Hub")
         .version("0.1.0")
         .author("Max Payne <forgge@gmail.com>")
@@ -78,11 +75,43 @@ fn main() {
         process::exit(1);
     }
 
-    // Create a message and publish it
-    let msg = mqtt::Message::new("test", "Hello world!", 0);
-    if let Err(e) =  cli.publish(msg) {
-        println!("Unable to publish:\n\t{:?}", e);
-        process::exit(1);
+    let mut port = serialport::open_with_settings(
+            tty.as_str(),
+            &serialport::SerialPortSettings {
+                baud_rate: 9600,
+                data_bits: serialport::DataBits::Eight,
+                flow_control: serialport::FlowControl::None,
+                parity: serialport::Parity::None,
+                stop_bits: serialport::StopBits::One,
+                timeout: Duration::from_millis(2000),
+            }
+        ).expect("failed to open TTY port");
+
+    loop {
+        let req = modbus::ReadHoldingRegisters::new(1000, 6);
+        let resp = modbus::do_master_req(42, &req, &mut port);
+
+        if let Ok(r) = resp {
+            // Unwrapping everything: do_master_req() must guarantee data presence if case of success.
+            // If it not there, then something bad happened
+
+            let temp = r.register(0).unwrap() as f32 + r.register(1).unwrap() as f32  / 100.0;
+            let mcu_temp = r.register(2).unwrap() as f32 + r.register(3).unwrap() as f32  / 100.0;
+            let humid = r.register(4).unwrap() as f32 + r.register(5).unwrap() as f32  / 100.0;
+
+            println!("temperature: {}, MCU temperature: {}, humidity: {}", temp, mcu_temp, humid);
+
+            // Create a message and publish it
+            let msg = mqtt::Message::new("test", "Hello world!", 0);
+            if let Err(e) =  cli.publish(msg) {
+                println!("Unable to publish:\n\t{:?}", e);
+                break;
+            }
+        } else {
+            println!("Error communicating with sensor: {}", resp.unwrap_err());
+        }
+
+        thread::sleep(time::Duration::from_secs(delay.into()));
     }
 
     // Disconnect from the broker

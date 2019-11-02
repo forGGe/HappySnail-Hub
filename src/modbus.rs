@@ -10,6 +10,9 @@ use std::fs::File;
 use std::io::{Read, Write, BufRead};
 use std::io::prelude::*;
 use std::io::BufReader;
+use std::path::Path;
+use std::time::Duration;
+use serialport;
 use typenum::*;
 use num::cast::AsPrimitive;
 use failure::{Error, Fail};
@@ -30,6 +33,8 @@ pub enum ModbusError {
     ReqRespMismatch,
     #[fail(display = "No such index")]
     NoSuchIdx,
+    #[fail(display = "Failed to configure serial port parameters")]
+    ConfigureFail,
     #[fail(display = "I/O Error")]
     IoErr,
 }
@@ -172,6 +177,7 @@ impl ReadAddrCountGenericResp {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct ReadAddrCountGeneric16BitResp {
     cnt: u8,
     data: Vec<u16>,
@@ -239,7 +245,7 @@ impl RequestPDU for ReadCoils {
 }
 
 // Modbus function #1 response.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ReadCoilsResp {
     resp: ReadAddrCountGenericResp,
     req: ReadCoils,
@@ -254,7 +260,7 @@ impl ResponsePDU for ReadCoilsResp {
 }
 
 impl ReadCoilsResp {
-    fn coil(&self, mut idx: u16) -> Result<bool, ModbusError> {
+    fn coil(&self, idx: u16) -> Result<bool, ModbusError> {
         self.resp.object(idx, self.req.0.addr)
     }
 }
@@ -299,7 +305,7 @@ fn test_read_coil() {
 /*------------------------------------------------------------------------------------------------*/
 
 // Modbus function #2: Read Discrete Inputs.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ReadDiscreteInputs(ReadAddrCountGeneric<U2>);
 
 impl RequestPDU for ReadDiscreteInputs {
@@ -311,6 +317,7 @@ impl RequestPDU for ReadDiscreteInputs {
 }
 
 // Modbus function #2 response.
+#[derive(Clone, Debug)]
 pub struct ReadDiscreteInputsResp {
     resp: ReadAddrCountGenericResp,
     req: ReadDiscreteInputs,
@@ -325,7 +332,7 @@ impl ResponsePDU for ReadDiscreteInputsResp {
 }
 
 impl ReadDiscreteInputsResp {
-    fn discrete_input(&self, mut idx: u16) -> Result<bool, ModbusError> {
+    fn discrete_input(&self, idx: u16) -> Result<bool, ModbusError> {
         self.resp.object(idx, self.req.0.addr)
     }
 }
@@ -333,7 +340,7 @@ impl ReadDiscreteInputsResp {
 /*------------------------------------------------------------------------------------------------*/
 
 // Modbus function #3: Read Multiple Holding Registers.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ReadHoldingRegisters(ReadAddrCountGeneric<U3>);
 
 impl ReadHoldingRegisters {
@@ -351,6 +358,7 @@ impl RequestPDU for ReadHoldingRegisters {
 }
 
 // Modbus function #3 response.
+#[derive(Clone, Debug)]
 pub struct ReadHoldingRegistersResp {
     resp: ReadAddrCountGeneric16BitResp,
     req: ReadHoldingRegisters,
@@ -365,7 +373,7 @@ impl ResponsePDU for ReadHoldingRegistersResp {
 }
 
 impl ReadHoldingRegistersResp {
-    fn register(&self, idx: u8) -> Result<u16, ModbusError> {
+    pub fn register(&self, idx: u8) -> Result<u16, ModbusError> {
         self.resp.object(idx)
     }
 }
@@ -373,7 +381,7 @@ impl ReadHoldingRegistersResp {
 /*------------------------------------------------------------------------------------------------*/
 
 // Modbus function #4: Read Multiple Input Registers.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ReadInputRegisters(ReadAddrCountGeneric<U4>);
 
 impl RequestPDU for ReadInputRegisters {
@@ -385,6 +393,7 @@ impl RequestPDU for ReadInputRegisters {
 }
 
 // Modbus function #4 response.
+#[derive(Clone, Debug)]
 pub struct ReadInputRegistersResp {
     resp: ReadAddrCountGeneric16BitResp,
     req: ReadInputRegisters,
@@ -438,8 +447,8 @@ impl ResponsePDU for WriteSingleCoilResp {
     type Req = WriteSingleCoil;
 
     fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
-        let resp_addr = u16::from_str_radix(&packet[0..4], 16).map_err(|e| ModbusError::InvalidData)?;
-        let resp_val = u16::from_str_radix(&packet[4..8], 16).map_err(|e| ModbusError::InvalidData)?;
+        let resp_addr = u16::from_str_radix(&packet[0..4], 16).map_err(|_| ModbusError::InvalidData)?;
+        let resp_val = u16::from_str_radix(&packet[4..8], 16).map_err(|_| ModbusError::InvalidData)?;
 
         if resp_addr != req.addr || resp_val != ( if req.coil { 0xff00 } else { 0x0000 } ) {
             Err(ModbusError::ReqRespMismatch)?
@@ -483,8 +492,8 @@ impl ResponsePDU for WriteSingleHoldingRegisterResp {
     type Req = WriteSingleHoldingRegister;
 
     fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
-        let resp_addr = u16::from_str_radix(&packet[0..4], 16).map_err(|e| ModbusError::InvalidData)?;
-        let resp_val = u16::from_str_radix(&packet[4..8], 16).map_err(|e| ModbusError::InvalidData)?;
+        let resp_addr = u16::from_str_radix(&packet[0..4], 16).map_err(|_| ModbusError::InvalidData)?;
+        let resp_val = u16::from_str_radix(&packet[4..8], 16).map_err(|_| ModbusError::InvalidData)?;
 
         if resp_addr != req.addr || resp_val != req.val {
             Err(ModbusError::ReqRespMismatch)?
@@ -548,8 +557,8 @@ impl ResponsePDU for WriteMultipleCoilsResp {
     type Req = WriteMultipleCoils;
 
     fn from_ascii(req: &Self::Req, packet: &String) -> Result<Self, ModbusError> {
-        let resp_addr = u16::from_str_radix(&packet[0..4], 16).map_err(|e| ModbusError::InvalidData)?;
-        let resp_val = u16::from_str_radix(&packet[4..8], 16).map_err(|e| ModbusError::InvalidData)?;
+        let resp_addr = u16::from_str_radix(&packet[0..4], 16).map_err(|_| ModbusError::InvalidData)?;
+        let resp_val = u16::from_str_radix(&packet[4..8], 16).map_err(|_| ModbusError::InvalidData)?;
 
         if resp_addr != req.addr || resp_val != req.cnt {
             Err(ModbusError::ReqRespMismatch)?
@@ -579,14 +588,14 @@ where
 
     let addr
         = u8::from_str_radix(packet.get(1..3).ok_or(ModbusError::InvalidAddr)?, 16)
-            .map_err(|e| ModbusError::InvalidAddr)?;
+            .map_err(|_| ModbusError::InvalidAddr)?;
     let fn_id
         = u8::from_str_radix(packet.get(3..5).ok_or(ModbusError::InvalidFnId)?, 16)
-            .map_err(|e| ModbusError::InvalidFnId)?;
+            .map_err(|_| ModbusError::InvalidFnId)?;
     let pdu = packet.get(5..len-4).ok_or(ModbusError::InvalidData)?;
     let crc
         = u8::from_str_radix(packet.get(len - 4..len - 2).ok_or(ModbusError::InvalidCRC)?, 16)
-            .map_err(|e| ModbusError::InvalidCRC)?;
+            .map_err(|_| ModbusError::InvalidCRC)?;
 
     // Data protected by CRC
     let data_under_crc = packet
@@ -601,7 +610,7 @@ where
     let mut complete_data = Vec::new();
 
     for chunk in data_under_crc {
-        let byte = u8::from_str_radix(str::from_utf8(chunk).unwrap(), 16).map_err(|e| ModbusError::InvalidData)?;
+        let byte = u8::from_str_radix(str::from_utf8(chunk).unwrap(), 16).map_err(|_| ModbusError::InvalidData)?;
         complete_data.push(byte);
     }
 
@@ -667,14 +676,34 @@ fn test_extract_response() {
     }
 }
 
-fn do_master_request<T, R>(addr: u8, req: &T, mut fl: &File, timeout: u32) -> Result<R, ModbusError>
+pub fn do_master_req<T, R>(addr: u8, req: &T, port: &mut Box<dyn serialport::SerialPort>) -> Result<R, ModbusError>
     where
         T: RequestPDU<Resp = R>,
         R: ResponsePDU<Req = T>,
 {
     let mut data = Vec::new();
-    fl.write_all(make_request_frame(addr, req).as_bytes()).map_err(|e| ModbusError::IoErr)?;
-    let mut reader = BufReader::new(fl);
-    reader.read_until(b'\n', &mut data).map_err(|e| ModbusError::IoErr)?;
-    extract_response(addr, req, &String::from_utf8(data).map_err(|e| ModbusError::IoErr)?)
+    let to_write = make_request_frame(addr, req);
+    println!("> {:?}", to_write);
+    port.write_all(to_write.as_bytes()).map_err(|_| ModbusError::IoErr)?;
+    let mut reader = BufReader::new(port);
+    reader.read_until(b'\n', &mut data).map_err(|_| ModbusError::IoErr)?;
+    let to_read = String::from_utf8(data).map_err(|_| ModbusError::IoErr)?;
+    println!("< {:?}", to_read);
+    extract_response(addr, req, &to_read)
+}
+
+pub fn do_master_req_tty<T, R>(addr: u8, req: &T, dev_path: &Path, timeout: u32) -> Result<R, ModbusError>
+    where
+        T: RequestPDU<Resp = R>,
+        R: ResponsePDU<Req = T>,
+{
+    let mut port = serialport::open(dev_path).map_err(|e| {
+        println!("error opening device: {}", e);
+        ModbusError::IoErr
+    })?;
+    port.set_timeout(Duration::from_millis(timeout as u64)).map_err(|e| {
+        println!("error configuring device: {}", e);
+        ModbusError::ConfigureFail
+    })?;
+    do_master_req(addr, req, &mut port)
 }
