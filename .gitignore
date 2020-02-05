@@ -1,2 +1,7 @@
 /target
 **/*.rs.bk
+
+# common libraries
+kicad/proto_I/hs_common
+# aux dirs from deps manager
+.peru
