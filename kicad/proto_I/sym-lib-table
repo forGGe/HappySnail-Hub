@@ -1,0 +1,3 @@
+(sym_lib_table
+  (lib (name HS_Common)(type Legacy)(uri /home/maxpayne/projects/HappySnail/HappySnail-Hub/kicad/hs_common/Symbols.lib)(options "")(descr ""))
+)

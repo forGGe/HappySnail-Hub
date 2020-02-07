@@ -2,6 +2,6 @@
 **/*.rs.bk
 
 # common libraries
-kicad/proto_I/hs_common
+kicad/hs_common
 # aux dirs from deps manager
 .peru
