@@ -3,4 +3,4 @@ imports:
 
 git module hs_common:
     url: https://github.com/forGGe/HappySnail-KiCAD_Common
-    rev: 12740ee4ee3f25fa4dce5324ff03a4e2cfadc27b
+    rev: hs_hub_proto_I_dev
